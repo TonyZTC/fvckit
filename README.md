@@ -1,6 +1,6 @@
 # sidekit
 This is a fork of the SIDEKIT python package (http://www-lium.univ-lemans.fr/sidekit/), forked from https://git-lium.univ-lemans.fr/Larcher/sidekit. 
-It includes some custom modifications as well as documentation on how to install and run it.
+It includes some custom modifications as well as documentation on how to work around some installation issues (now that theano is no longer maintained, `pip install sidekit` results in errors about pygpu).
 
 ## Linux
 
@@ -22,9 +22,13 @@ It includes some custom modifications as well as documentation on how to install
 
 ### Install dependencies (Theano and working libsvm)
 
-	  conda install -c mila-udem -c mila-udem/label/pre theano pygpu
-	  conda install -c conda-forge libsvm=3.21
+    conda install -c mila-udem -c mila-udem/label/pre theano pygpu
+    conda install -c conda-forge libsvm=3.21
 	
+### Install sidekit
+
+    pip install sidekit
+
 ### Set environment variables (add them to ~/.bashrc or something)
 
     MKL_THREADING_LAYER=GNU
