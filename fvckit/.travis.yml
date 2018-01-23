@@ -1,0 +1,16 @@
+language: python
+
+python:
+  - "2.7"
+  - "3.6"
+
+notifications:
+  email: false
+
+before_install:
+
+install:
+  - pip install .
+
+#script:
+#  - nosetests -v -w tests/
