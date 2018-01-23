@@ -47,7 +47,7 @@ from fvckit.bosaris import Scores
 from fvckit.bosaris import Key
 
 
-__author__ = "Anthony Larcher"
+__author__ = "Anthony Larcher, Andreas Nautsch"
 __maintainer__ = "Anthony Larcher"
 __email__ = "anthony.larcher@univ-lemans.fr"
 __status__ = "Production"
@@ -509,6 +509,50 @@ def fast_minDCF(tar, non, plo, normalize=False):
 
     return minDCF, Pmiss[0], Pfa[0], prbep, eer
 
+def fast_act_dcf(tar, non, eta, normalize=False):
+    """Computes the actual average cost of making Bayes decisions with scores
+    calibrated to act as log-likelihood-ratios. The average cost (DCF) is
+    computed for a given range of target priors and for unity cost of error.
+    If un-normalized, DCF is just the Bayes error-rate.
+
+    Note, the decision rule applied here is to accept if:
+
+        llr >= Bayes threshold.
+
+    or reject otherwise. The >= is a consequence of the stability of the
+    sort algorithm , where equal values remain in the original order.
+
+    :param tar: vector of target scores
+    :param non: vector of non-target scores
+    :param eta: vector of Bayes thresholds (in log-LR domain, descending order)
+    :param normalize: if true, return normalized minDCF, else un-normalized (optional, default = false)
+    :return: the DCF value
+    :return: the miss probabilities for these points
+    :return: the false-alarm probability for these point
+    """
+    D = eta.shape[0]
+    T = tar.shape[0]
+    N = non.shape[0]
+
+    perturb = numpy.argsort(numpy.concatenate((eta, tar)), kind='mergesort')
+    r = numpy.zeros(T + D)
+    r[perturb] = numpy.arange(T + D) + 1
+    r = r[:D]  # rank of thresholds
+    Pmiss = (r - numpy.arange(start=D, stop=0, step=-1)) / T
+
+    perturb = numpy.argsort(numpy.concatenate((eta, non)), kind='mergesort')
+    r = numpy.zeros(N + D)
+    r[perturb] = numpy.arange(N + D) + 1
+    r = r[:D]  # rank of thresholds
+    Pfa = (N - r + numpy.arange(start=D, stop=0, step=-1)) / N
+
+    Ptar = sigmoid(-eta)
+    Pnon = sigmoid(eta)
+    dcf = Ptar * Pmiss + Pnon * Pfa
+    if normalize:
+        dcf = dcf / min([Ptar, Pnon])
+    return dcf, Pmiss, Pfa
+
 
 def plotseg(xx, yy, box, dps):
     """Prepare the plotting of a curve.
@@ -677,8 +721,8 @@ class DetPlot:
         if not self.__title__ == '':
             mpl.title(self.__title__)
         mpl.grid(True)
-        mpl.xlabel('False Rejection Rate [in %]')
-        mpl.ylabel('False Acceptance Rate [in %]')
+        mpl.xlabel('False Acceptance Rate [in %]')
+        mpl.ylabel('False Rejection Rate [in %]')
 
         # assuring, limits are kept by matplotlib after probit transform of axes
         mpl.gca().set_xlim(
@@ -731,7 +775,7 @@ class DetPlot:
         tar, non = scores.get_tar_non(key)
         self.set_system(tar, non, sys_name)
 
-    def plot_steppy_det(self, idx=0, style='color', plot_args=''):
+    def plot_steppy_det(self, idx=0, style='color', plot_args='', plot_legend=True):
         """Plots a DET curve.
         
         :param idx: the idx of the curve to plot in case tar and non have 
@@ -739,6 +783,8 @@ class DetPlot:
         :param style: style of the curve, can be gray or color
         :param plot_args: a cell array of arguments to be passed to plot 
             that control the appearance of the curve.
+        :param plot_legend: Optional. Determines whether to include legend
+            in the plot.
         """
         Pmiss, Pfa = __compute_roc__(self.__tar__[idx], self.__non__[idx])
         Pmiss, Pfa = __filter_roc__(Pmiss, Pfa)
@@ -759,11 +805,12 @@ class DetPlot:
                        color=plot_args[0],
                        linestyle=plot_args[1],
                        linewidth=plot_args[2])
-        mpl.legend()
+        if plot_legend:
+            mpl.legend()
         if matplotlib.get_backend() == 'agg':
             mpl.savefig(self.__title__ + '.pdf')
 
-    def plot_rocch_det(self, idx=0, style='color', target_prior=0.001, plot_args=''):
+    def plot_rocch_det(self, idx=0, style='color', target_prior=0.001, plot_args='', plot_legend=True):
         """Plots a DET curve using the ROCCH.
 
         :param idx: index of the figure to plot on
@@ -771,6 +818,8 @@ class DetPlot:
         :param target_prior: prior of the target trials
         :param plot_args: a list of arguments to be passed
             to plot that control the appearance of the curve.
+        :param plot_legend: Optional. Determines whether to include legend
+            in the plot.
         """
         # In case the plotting arguments are not specified, they are initialized
         # by using default values
@@ -800,7 +849,8 @@ class DetPlot:
                        color=plot_args[0],
                        linestyle=plot_args[1],
                        linewidth=plot_args[2])
-        mpl.legend()
+        if plot_legend:
+            mpl.legend()
         if matplotlib.get_backend() == 'agg':
             mpl.savefig(self.__title__ + '.pdf')
 

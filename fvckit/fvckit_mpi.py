@@ -34,19 +34,24 @@ import logging
 import h5py
 import scipy
 import sys
-from fvckit.statserver import StatServer
+from fvckit.features_server import FeaturesServer
+from fvckit.statserver import StatServer, sum_log_probabilities
 from fvckit.factor_analyser import FactorAnalyser
 from fvckit.mixture import Mixture
 from fvckit.fvckit_io import write_matrix_hdf5, read_matrix_hdf5
-
+from fvckit import IdMap, Ndx, Key, STAT_TYPE
 from fvckit.sv_utils import serialize
-from fvckit.factor_analyser import e_on_batch
+from fvckit.factor_analyser import e_on_batch, e_on_batch_log_evidence
 from mpi4py import MPI
+from psutil import virtual_memory
+from scipy.spatial import distance
+from scipy.special import erfcinv, gamma
+import time
 
 
 __license__ = "LGPL"
-__author__ = "Anthony Larcher and Sylvain Meignier (SIDEIT), Ewald Enzinger (FVCKIT)"
-__copyright__ = "Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEIT), Ewald Enzinger (FVCKIT)"
+__copyright__ = "Copyright 2014-2017 Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"
 __status__ = "Production"
@@ -57,6 +62,7 @@ data_type = numpy.float32
 def total_variability(stat_server_file_name,
                       ubm,
                       tv_rank,
+                      start_iter=0,
                       nb_iter=20,
                       min_div=True,
                       tv_init=None,
@@ -132,13 +138,17 @@ def total_variability(stat_server_file_name,
             factor_analyser.write(output_file_name + "_init.h5")
 
     # Iterative training of the FactorAnalyser
-    for it in range(nb_iter):
+    if start_iter != 0:
+        start_iter = start_iter + 1
+
+    for it in range(start_iter, nb_iter):
         if comm.rank == 0:
             logging.critical("Start it {}".format(it))
 
         _A = numpy.zeros((nb_distrib, tv_rank * (tv_rank + 1) // 2), dtype=data_type)
         _C = numpy.zeros((tv_rank, sv_size), dtype=data_type)
         _R = numpy.zeros((tv_rank * (tv_rank + 1) // 2), dtype=data_type)
+        log_evidence_local = 0
 
         if comm.rank == 0:
             total_session_nb = 0
@@ -160,7 +170,12 @@ def total_variability(stat_server_file_name,
                 local_session_idx = numpy.array_split(range(nb_sessions), comm.size)
                 stat0 = fh['stat0'][local_session_idx[comm.rank], :]
                 stat1 = fh['stat1'][local_session_idx[comm.rank], :]
-                e_h, e_hh = e_on_batch(stat0, stat1, ubm, factor_analyser.F)
+                e_h, e_hh, logE = e_on_batch_log_evidence(stat0, stat1, ubm, factor_analyser.F)
+
+                if numpy.isnan(logE):
+                    logging.critical('nan log evidence on comm {}'.format(comm.rank))
+
+                log_evidence_local += logE / nb_sessions / comm.size
 
                 _A += stat0.T.dot(e_hh)
                 _C += e_h.T.dot(stat1)
@@ -176,10 +191,12 @@ def total_variability(stat_server_file_name,
             total_A = numpy.zeros_like(_A)
             total_C = numpy.zeros_like(_C)
             total_R = numpy.zeros_like(_R)
+            log_evidence = numpy.zeros(1)
         else:
             total_A = [None] * _A.shape[0]
             total_C = None
             total_R = None
+            log_evidence = None
 
         # Accumulate _A, using a list in order to avoid limitations of MPI (impossible to reduce matrices bigger
         # than 4GB)
@@ -213,24 +230,52 @@ def total_variability(stat_server_file_name,
             root=0
         )
 
+        comm.Reduce(
+            [log_evidence_local, MPI.FLOAT],
+            [log_evidence, MPI.FLOAT],
+            op=MPI.SUM,
+            root=0
+        )
+
         comm.Barrier()
            
         # M-step
         if comm.rank == 0:
+            logging.info('log-evidence: {}'.format(log_evidence[0]))
 
             total_R /= total_session_nb
+
+            if logging.getLogger().level == logging.DEBUG:
+                # in case of debugging, save matrixes
+                write_matrix_hdf5(total_A, output_file_name + '_total_A_it-{}.h5'.format(it))
+                write_matrix_hdf5(total_C, output_file_name + '_total_C_it-{}.h5'.format(it))
+                write_matrix_hdf5(total_R, output_file_name + '_total_R_it-{}.h5'.format(it))
+
             _A_tmp = numpy.zeros((tv_rank, tv_rank), dtype=data_type)
             for c in range(nb_distrib):
                 distrib_idx = range(c * feature_size, (c + 1) * feature_size)
                 _A_tmp[upper_triangle_indices] = _A_tmp.T[upper_triangle_indices] = total_A[c, :]
+                _A_tmp_cond = numpy.linalg.cond(_A_tmp)
+                if _A_tmp_cond > 1e6:
+                    logging.debug('large condition number {} found at component {}'.format(_A_tmp_cond, c))
                 factor_analyser.F[distrib_idx, :] = scipy.linalg.solve(_A_tmp, total_C[:, distrib_idx]).T
+
+            logging.debug('max(abs(TV)) {}'.format(numpy.abs(factor_analyser.F).max()))
 
             # minimum divergence
             if min_div:
                 _R_tmp = numpy.zeros((tv_rank, tv_rank), dtype=data_type)
                 _R_tmp[upper_triangle_indices] = _R_tmp.T[upper_triangle_indices] = total_R
-                ch = scipy.linalg.cholesky(_R_tmp)
+                # if not positive definite, fix by minimum impact to diagonal
+                _R_tmp_min_eigval = numpy.linalg.eigvals(_R_tmp).min()
+                if _R_tmp_min_eigval <= 0:
+                    while _R_tmp_min_eigval <= 0:
+                        logging.debug('ill-conditioned _R_tmp, not positive-definite, add {} to diagonal'.format(_R_tmp_min_eigval))
+                        _R_tmp = _R_tmp - _R_tmp_min_eigval * numpy.eye(tv_rank, tv_rank)
+                        _R_tmp_min_eigval = numpy.linalg.eigvals(_R_tmp).min()
+                ch = scipy.linalg.cholesky(_R_tmp).T
                 factor_analyser.F = factor_analyser.F.dot(ch)
+                logging.debug('max(abs(TV)) after min. div. {}'.format(numpy.abs(factor_analyser.F).max()))
 
             # Save the current FactorAnalyser
             if output_file_name is not None:
@@ -240,6 +285,135 @@ def total_variability(stat_server_file_name,
                     factor_analyser.write(output_file_name + ".h5")
         factor_analyser.F = comm.bcast(factor_analyser.F, root=0)
         comm.Barrier()
+
+
+def accumulate_statistics(idmap, feature_server, ubm, statserver_file_name, channel_extension=("", "_b")):
+    assert (isinstance(feature_server, FeaturesServer))
+    assert (isinstance(ubm, Mixture))
+
+    comm = MPI.COMM_WORLD
+    comm.Barrier()
+
+    if not os.path.exists(statserver_file_name):
+        if isinstance(idmap, Ndx) or isinstance(idmap, Key):
+            idmap_tmp = IdMap()
+            idmap_tmp.leftids = idmap.segset
+            idmap_tmp.rightids = idmap.segset
+            idmap_tmp.start = numpy.empty(idmap.segset.shape[0], dtype="|O")
+            idmap_tmp.stop = numpy.empty(idmap.segset.shape[0], dtype="|O")
+            assert (idmap_tmp.validate())
+            idmap = idmap_tmp
+        assert (isinstance(idmap, IdMap))
+        feature_server.keep_all_features = True
+        comm.Barrier()
+
+        if comm.rank == 0:
+            # create temporary statsserver file
+            tmp_stats_file = '{}_empty_tmp'.format(statserver_file_name)
+            stat_server = StatServer(statserver_file_name=idmap,
+                                     distrib_nb=ubm.get_distrib_nb(),
+                                     feature_size=ubm.dim(),
+                                     index=None)
+            stat_server.write(tmp_stats_file)
+            logging.debug('accumulating stats for: {} - {}'.format(stat_server.segset.shape, stat_server.segset))
+        else:
+            tmp_stats_file = None
+        tmp_stats_file = comm.bcast(tmp_stats_file, root=0)
+        comm.Barrier()
+
+        # Set useful variables
+        nb_distrib = ubm.w.shape[0]
+        feature_size = ubm.mu.shape[1]
+        stat0_rank = nb_distrib
+        stat1_rank = nb_distrib * feature_size
+
+        # Work on each node with different data
+        nb_sessions = idmap.leftids.shape[0]
+        # max. 2^32 - 1 stat1 values to gather back due to mpi4py
+        max_nb_sessions_per_cycle = int(numpy.floor((2 ** 31 - 1) / ubm.sv_size()))
+        nb_cycles = int(numpy.ceil(nb_sessions / max_nb_sessions_per_cycle)) + 1 # +1 is merely assuring in-memory
+        all_session_idx = numpy.array_split(numpy.arange(nb_sessions), nb_cycles, axis=0)
+        for cycle_idx in range(nb_cycles):
+            indices = numpy.array_split(all_session_idx[cycle_idx], comm.size, axis=0)
+
+            sendcounts_stat0 = numpy.array([idx.shape[0] * stat0_rank for idx in indices])
+            displacements_stat0 = numpy.hstack((0, numpy.cumsum(sendcounts_stat0)[:-1]))
+            sendcounts_stat1 = numpy.array([idx.shape[0] * stat1_rank for idx in indices])
+            displacements_stat1 = numpy.hstack((0, numpy.cumsum(sendcounts_stat1)[:-1]))
+
+            time.sleep(comm.rank * 5) # give 5s for each cpu to read data, as memory in subroutine can get larger
+            stat_server = StatServer.read_subset(tmp_stats_file, indices[comm.rank])
+            comm.Barrier()
+
+            # accumulate stats
+            if comm.rank == 0:
+                stat0 = numpy.zeros((all_session_idx[cycle_idx].shape[0], stat0_rank))
+                stat1 = numpy.zeros((all_session_idx[cycle_idx].shape[0], stat1_rank))
+            else:
+                stat0 = None
+                stat1 = None
+
+            local_stat0 = numpy.zeros((stat_server.modelset.shape[0], stat0_rank))
+            local_stat1 = numpy.zeros((stat_server.modelset.shape[0], stat1_rank))
+
+            # Replicate stat0
+            index_map = numpy.repeat(numpy.arange(nb_distrib), feature_size)
+            for idx in range(stat_server.segset.shape[0]):
+                logging.debug('Compute statistics for {}'.format(stat_server.segset[idx]))
+
+                show = stat_server.segset[idx]
+
+                # If using a FeaturesExtractor, get the channel number by checking the extension of the show
+                channel = 0
+                if feature_server.features_extractor is not None and show.endswith(channel_extension[1]):
+                    channel = 1
+                show = show[:show.rfind(channel_extension[channel])]
+
+                cep, vad = feature_server.load(show, channel=channel)
+                stop = vad.shape[0] if stat_server.stop[idx] is None else min(stat_server.stop[idx], vad.shape[0])
+                data = cep[stat_server.start[idx]:stop, :]
+                data = data[vad[stat_server.start[idx]:stop], :]
+
+                # Verify that frame dimension is equal to gmm dimension
+                if not ubm.dim() == data.shape[1]:
+                    raise Exception('dimension of ubm and features differ: {:d} / {:d}'.format(ubm.dim(), data.shape[1]))
+                else:
+                    if ubm.invcov.ndim == 2:
+                        lp = ubm.compute_log_posterior_probabilities(data)
+                    else:
+                        lp = ubm.compute_log_posterior_probabilities_full(data)
+                    pp, _ = sum_log_probabilities(lp)
+                    # Compute 0th-order statistics
+                    local_stat0[idx, :] = pp.sum(0)
+                    if (local_stat0[idx, :]==0).any():
+                        logging.critical('unexpected zero probability encountered at: {}'.format(numpy.unique(numpy.where(local_stat0[idx, :]==0)[0])))
+                    # Compute 1st-order statistics
+                    local_stat1[idx, :] = numpy.reshape(numpy.transpose(numpy.dot(data.transpose(), pp)), ubm.sv_size()).astype(STAT_TYPE)
+            comm.Barrier()
+
+            comm.Gatherv(local_stat0, [stat0, sendcounts_stat0, displacements_stat0, MPI.DOUBLE], root=0)
+            comm.Gatherv(local_stat1, [stat1, sendcounts_stat1, displacements_stat1, MPI.DOUBLE], root=0)
+
+            if comm.rank == 0:
+                stat_server = StatServer.read_subset(tmp_stats_file, all_session_idx[cycle_idx])
+                """
+                stat_server = StatServer(statserver_file_name=idmap.filter_on_left(stat_server.modelset[indices], keep=True),
+                                         distrib_nb=ubm.get_distrib_nb(),
+                                         feature_size=ubm.dim(),
+                                         index=None)
+                """
+                stat_server.stat0 = stat0
+                stat_server.stat1 = stat1
+                logging.debug('saving sub stat0 {}, stat1 {}, statserver {}'.format(stat0.shape, stat1.shape, stat_server))
+                stat_server.write('{}_sub-{}.h5'.format(statserver_file_name, cycle_idx))
+
+        if comm.rank == 0:
+            stat_server_lst = []
+            for cycle_idx in range(nb_cycles):
+                stat_server_lst.append(StatServer(statserver_file_name='{}_sub-{}.h5'.format(statserver_file_name, cycle_idx)))
+            stat_server = StatServer.merge(*stat_server_lst)
+            stat_server.write(statserver_file_name)
+            os.remove(tmp_stats_file)
 
 
 def extract_ivector(tv,
@@ -277,7 +451,7 @@ def extract_ivector(tv,
 
     # Work on each node with different data
     indices = numpy.array_split(numpy.arange(nb_sessions), comm.size, axis=0)
-    sendcounts = numpy.array([idx.shape[0] * tv.F.shape[1]  for idx in indices])
+    sendcounts = numpy.array([idx.shape[0] * tv_rank  for idx in indices])
     displacements = numpy.hstack((0, numpy.cumsum(sendcounts)[:-1]))
 
     stat_server = StatServer.read_subset(stat_server_file_name, indices[comm.rank])
@@ -350,6 +524,7 @@ def EM_split(ubm,
              save_partial=False,
              ceil_cov=10,
              floor_cov=1e-2,
+             ifs_eu=None,
              num_thread=1):
     """Expectation-Maximization estimation of the Mixture parameters.
 
@@ -367,62 +542,148 @@ def EM_split(ubm,
     :return llk: a list of log-likelihoods obtained after each iteration
     """
 
-    # Load the features
-    features = features_server.stack_features_parallel(feature_list, num_thread=num_thread)
-
     comm = MPI.COMM_WORLD
     comm.Barrier()
 
     if comm.rank == 0:
         import sys
-
         llk = []
-
-        # Initialize the mixture
-        n_frames, feature_size = features.shape
-        mu = features.mean(axis=0)
-        cov = numpy.mean(features**2, axis=0)
-        ubm.mu = mu[None]
-        ubm.invcov = 1./cov[None]
-        ubm.w = numpy.asarray([1.0])
-        ubm.cst = numpy.zeros(ubm.w.shape)
-        ubm.det = numpy.zeros(ubm.w.shape)
-        ubm.cov_var_ctl = 1.0 / copy.deepcopy(ubm.invcov)
-        ubm._compute_all()
-
+        logging.debug('broadcasting data for parallel training, in total {} samples'.format(len(feature_list)))
     else:
-        n_frames = None
-        feature_size = None
-        features = None
+        llk = None
+
+    # Work on each node with different data
+    indices = numpy.array_split(numpy.arange(len(feature_list)), comm.size, axis=0)
 
     comm.Barrier()
+    if comm.rank == 0:
+        logging.debug('data broadcasted, barrier established, iterations ...')
 
-    # Broadcast the UBM on each process
-    ubm = comm.bcast(ubm, root=0)
+    # compute local features, conduct intelligent feature selection based on Euclidean distance (IFS-EU)
+    # see T. Hasan and J.H.L. Hansen: A Study on Universal Background Model Training in Speaker Verification,
+    # TASLP, 19(7), p. 1890-1899, 2011.
+    local_show_list = list(numpy.array(feature_list)[indices[comm.rank]])
+    logging.debug('{} comm selects features from {} samples'.format(comm.rank, len(local_show_list)))
+    local_features = []
+    if ifs_eu is not None:
+        alpha_quantile = 0.1
+        beta_mu = 0.8
+        beta_std = 0.6
+        """
+        alpha_quantile = ifs_eu[0]
+        beta_mu = ifs_eu[1]
+        beta_std = ifs_eu[2]
+        """
+        alpha_erfcinv = erfcinv(2*alpha_quantile)
+        for show in local_show_list:
+            show_features = features_server.load(show)[0]
+            k = show_features.shape[1]
+            gamma_ratio_k = gamma((1+k)/2) / gamma(k/2)
+            i = 0
+            local_features.append(show_features[i,:])
+            while i < show_features.shape[0]-1 - 1:
+                # init
+                mu_x = show_features[i:i+2,:].mean(axis=0)
+                std_x = 0.5 * (show_features[i,:]**2 + show_features[i+1,:]**2) - mu_x**2
+                for j in range(i+1, show_features.shape[0]):
+                    avg_std_x = std_x.mean()
+                    mu_d = 2 * numpy.sqrt(avg_std_x) * k * gamma_ratio_k
+                    std_d = 2 * k * avg_std_x - mu_d**2
+                    dth = mu_d + numpy.sqrt(2) * std_d * alpha_erfcinv
 
-    # Send n_frames and feature_size to all process
-    n_frames = comm.bcast(n_frames, root=0)
-    feature_size = comm.bcast(feature_size, root=0)
+                    d = distance.euclidean(show_features[i,:], show_features[j,:])
+                    if d > dth:
+                        i = j
+                        local_features.append(show_features[i,:])
+                        break # start procedure all over again
 
-    # Compute the size of all matrices to scatter to each process
-    indices = numpy.array_split(numpy.arange(n_frames), comm.size, axis=0)
-    sendcounts = numpy.array([idx.shape[0] * feature_size for idx in indices])
-    displacements = numpy.hstack((0, numpy.cumsum(sendcounts)[:-1]))
+                    mu_x = beta_mu * mu_x + (1-beta_mu) * show_features[j,:]
+                    std_x = beta_std * std_x + (1-beta_std) * distance.sqeuclidean(show_features[j,:], mu_x)
+                break # as j reached show_features.shape[0], and any i = j will cause a break, unavoidably
+        local_features = numpy.stack(local_features)
+        logging.debug('comm {} selected local features via IFS-EU, starting EM with {} frames'.format(comm.rank, local_features.shape))
+    else:
+        for show in local_show_list:
+            show_features = features_server.load(show)[0]
+            local_features.append(show_features)
+        local_features = numpy.concatenate(local_features, axis=0)
+        logging.debug('comm {} selected local features (all), starting EM with {} frames'.format(comm.rank, local_features.shape))
 
-    # Scatter features on all process
-    local_features = numpy.empty((indices[comm.rank].shape[0], feature_size))
-
-    comm.Scatterv([features, tuple(sendcounts), tuple(displacements), MPI.DOUBLE], local_features)
-    comm.Barrier()
-
-    # for N iterations:
-    for nbg, it in enumerate(iterations[:int(numpy.log2(distrib_nb))]):
+    # if UBM is empty, initialize with features
+    if ubm.get_distrib_nb() == 0:
+        local_num = numpy.array([local_features.shape[0]], dtype=STAT_TYPE)
+        local_mu = local_features.mean(axis=0) * local_num
 
         if comm.rank == 0:
-            logging.critical("Start training model with {} distributions".format(2**nbg))
+            features_num = numpy.zeros(1)
+            features_mu = numpy.zeros(local_mu.shape[0])
+            features_cov = numpy.zeros(local_mu.shape[0])
+        else:
+            features_num = None
+            features_mu = None
+            features_cov = None
+
+        comm.Barrier()
+        comm.Reduce(
+            [local_num, MPI.DOUBLE],
+            [features_num, MPI.DOUBLE],
+            op=MPI.SUM,
+            root=0
+        )
+        comm.Reduce(
+            [local_mu, MPI.DOUBLE],
+            [features_mu, MPI.DOUBLE],
+            op=MPI.SUM,
+            root=0
+        )
+        comm.Barrier()
+        if comm.rank == 0:
+            mu = features_mu / features_num[0]
+        else:
+            mu = None
+        mu = comm.bcast(mu, root=0)
+        comm.Barrier()
+        logging.debug('bcast mu: {}'.format(mu.shape))
+
+        local_cov = numpy.mean((local_features - mu) ** 2, axis=0) * local_num
+        comm.Barrier()
+        logging.debug('local cov: {}'.format(local_cov.shape))
+
+        comm.Reduce(
+            [local_cov, MPI.DOUBLE],
+            [features_cov, MPI.DOUBLE],
+            op=MPI.SUM,
+            root=0
+        )
+        comm.Barrier()
+
+        # Initialize the mixture for empty ubm, otherwise take ubm as basis
+        if comm.rank == 0:
+            cov = features_cov / features_num[0]
+            logging.debug('ubm cov: {}'.format(cov.shape))
+            ubm.mu = mu[None]
+            ubm.invcov = 1. / cov[None]
+            ubm.w = numpy.asarray([1.0])
+            ubm.cst = numpy.zeros(ubm.w.shape)
+            ubm.det = numpy.zeros(ubm.w.shape)
+            ubm.cov_var_ctl = 1.0 / copy.deepcopy(ubm.invcov)
+            ubm._compute_all()
+        else:
+            ubm = None
+        # Broadcast the UBM on each process
+        ubm = comm.bcast(ubm, root=0)
+        comm.Barrier()
+
+    # for N iterations:
+    for nbg, it in enumerate(iterations[int(numpy.log2(ubm.get_distrib_nb())):int(numpy.log2(distrib_nb))]):
+
+        if comm.rank == 0:
+            logging.critical("Start training model with {} distributions".format(2**numpy.log2(ubm.get_distrib_nb())))
             # Save current model before spliting
             if save_partial:
                 ubm.write(output_filename + '_{}g.h5'.format(ubm.get_distrib_nb()), prefix='')
+
+        comm.Barrier()
 
         ubm._split_ditribution()
             
@@ -446,9 +707,41 @@ def EM_split(ubm,
             else:
                 _tmp_llk = numpy.array([None])
 
+            comm.Barrier()
+
             # E step
-            logging.critical("\nStart E-step, rank {}".format(comm.rank))
-            local_llk = numpy.array(ubm._expectation(local_accum, local_features))
+            logging.critical("Start E-step, rank {}".format(comm.rank))
+
+            # use up to 80% of available bytes in memory of server running current MPI process
+            assert(isinstance(local_features, numpy.ndarray))
+            weight_memory_allocation = 4 # following mem estimate is too restrictive # 0.8 # (0, 1], e.g. 0.8 for 80%
+            # considering: #features, #distr, #cep and covariance calculation of features
+            max_features_per_accum = virtual_memory()._asdict()['available']\
+                                     / local_features.dtype.itemsize\
+                                     / (ubm.get_distrib_nb()**2)\
+                                     / ubm.dim()\
+                                     / comm.size\
+                                     * weight_memory_allocation
+
+            if max_features_per_accum <= 1.0:
+                logging.critical("memory will run out, choose less #cores, e.g. {}".format(max_features_per_accum * comm.size))
+                assert(max_features_per_accum > 1.0)
+            max_features_per_accum = int(max_features_per_accum)
+
+            comm.Barrier()
+
+            if local_features.shape[0] > max_features_per_accum:
+                local_llk = ubm._expectation(local_accum, local_features[:max_features_per_accum, :])
+                num_accums = int(local_features.shape[0] / max_features_per_accum) + 1
+                for accum_id in range(1, num_accums):
+                    start_accum = int(accum_id * max_features_per_accum)
+                    end_accum = int(min((accum_id + 1) * max_features_per_accum, local_features.shape[0]))
+                    if accum_id % 1000 == 0:
+                        logging.debug('accumulating (rank: {}) {} of {}'.format(comm.rank, accum_id, num_accums))
+                    local_llk += ubm._expectation(local_accum, local_features[start_accum:end_accum, :])
+                local_llk = numpy.array(local_llk)
+            else:
+                local_llk = numpy.array(ubm._expectation(local_accum, local_features))
 
             # Reduce all accumulators in process 1
             comm.Barrier()

@@ -38,8 +38,8 @@ from fvckit.sv_utils import mean_std_many
 import sys
 
 __license__ = "LGPL"
-__author__ = "Anthony Larcher and Sylvain Meignier (SIDEIT), Ewald Enzinger (FVCKIT)"
-__copyright__ = "Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEIT), Ewald Enzinger (FVCKIT)"
+__copyright__ = "Copyright 2014-2017 Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"
 __status__ = "Production"
@@ -604,7 +604,7 @@ class Mixture(object):
             # ADD VARIANCE CONTROL
             for gg in range(self.w.shape[0]):
                 self.invcov[gg] = numpy.linalg.inv(cov[gg])
-                self.invchol[gg] = numpy.linalg.cholesky(self.invcov[gg]).T
+                self.invchol[gg] = numpy.linalg.cholesky(self.invcov[gg])
         self._compute_all()
 
     def _init(self, features_server, feature_list, num_thread=1):
@@ -729,7 +729,6 @@ class Mixture(object):
 
         """Expectation-Maximization estimation of the Mixture parameters.
 
-        :param cep: set of feature frames to consider
         :param cep: set of feature frames to consider
         :param distrib_nb: number of distributions
         :param iteration_min: minimum number of iterations to perform
@@ -919,3 +918,23 @@ class Mixture(object):
 
         self._compute_all()
         assert self.validate(), "Error while merging models"
+
+    def remove_singular_or_sparse_components(self, floor=1e-2, ceil=10):
+        """
+        Removes signular or sparse components, i.e. those which floored or ceiled covariance
+        :param floor: floor value used during training
+        :param ceil: ceil value used during training
+        """
+        is_floor_cov = numpy.where(self.invcov >= 1/floor)[0]
+        is_ceil_cov = numpy.where(self.invcov <= 1/ceil)[0]
+
+        is_singular_or_sparse = numpy.union1d(is_floor_cov, is_ceil_cov)
+
+        self.mu = numpy.delete(self.mu, is_singular_or_sparse, axis=0)
+        self.invcov = numpy.delete(self.invcov, is_singular_or_sparse, axis=0)
+        self.w = numpy.delete(self.w, is_singular_or_sparse, axis=0)
+        # re-normalize weights
+        self.w = self.w / self.w.sum()
+        self.cov_var_ctl = 1.0 / copy.deepcopy(self.invcov)
+        self._compute_all()
+

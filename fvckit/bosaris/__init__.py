@@ -28,9 +28,10 @@ from fvckit.bosaris.detplot import DetPlot
 from fvckit.bosaris.detplot import effective_prior
 from fvckit.bosaris.detplot import logit_effective_prior
 from fvckit.bosaris.detplot import fast_minDCF
+from fvckit.bosaris.seg_quality import SegQuality
 
 
-__author__ = "Anthony Larcher"
+__author__ = "Anthony Larcher, Andreas Nautsch"
 __maintainer__ = "Anthony Larcher"
 __email__ = "anthony.larcher@univ-lemans.fr"
 __status__ = "Production"

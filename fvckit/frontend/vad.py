@@ -31,11 +31,12 @@ import logging
 import numpy
 from scipy.fftpack import fft
 from scipy import ndimage
+from scipy.stats.mstats import gmean
 from fvckit.mixture import Mixture
 
 
 __author__ = "Anthony Larcher and Sylvain Meignier (SIDEIT), Ewald Enzinger (FVCKIT)"
-__copyright__ = "Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
+__copyright__ = "Copyright 2014-2017 Anthony Larcher, Sylvain Meignier and Andreas Nautsch (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __license__ = "LGPL"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"
@@ -329,15 +330,7 @@ def vad_percentil(log_energy, percent):
     return log_energy > thr, thr
 
 
-def vad_energy(log_energy,
-               distrib_nb=3,
-               nb_train_it=8,
-               flooring=0.0001, ceiling=1.0,
-               alpha=2):
-    # center and normalize the energy
-    log_energy = (log_energy - numpy.mean(log_energy)) / numpy.std(log_energy)
-
-    # Initialize a Mixture with 2 or 3 distributions
+def train_vad_gmm(data, distrib_nb, nb_train_it=8, flooring=0.0001, ceiling=1.0):
     world = Mixture()
     # set the covariance of each component to 1.0 and the mean to mu + meanIncrement
     world.cst = numpy.ones(distrib_nb) / (numpy.pi / 2.0)
@@ -360,12 +353,103 @@ def vad_energy(log_energy,
         # M-step
         world._maximization(accum, ceiling, flooring)
 
+    return world
+
+
+def vad_energy(log_energy,
+               distrib_nb=3,
+               nb_train_it=8,
+               flooring=0.0001, ceiling=1.0,
+               alpha=2):
+    # center and normalize the energy
+    log_energy = (log_energy - numpy.mean(log_energy)) / numpy.std(log_energy)
+
+    # Initialize a Mixture with 2 or 3 distributions
+    world = train_vad_gmm(data=log_energy, distrib_nb=distrib_nb, nb_train_it=nb_train_it, flooring=flooring, ceiling=ceiling)
+
     # Compute threshold
     threshold = world.mu.max() - alpha * numpy.sqrt(1.0 / world.invcov[world.mu.argmax(), 0])
 
     # Apply frame selection with the current threshold
     label = log_energy > threshold
     return label, threshold
+
+
+def vad_unsupervised_gmm(cep,
+                         initial_speech_scores,
+                         init_percentile=10,
+                         distrib_nb=16,
+                         nb_train_it=8,
+                         flooring=0.0001, ceiling=1.0,
+                         sliding_window=23,
+                         threshold_percentile=20):
+    """
+    Unsupervised GMM-based VAD as proposed in
+    Alam, Kenny, Ouellet, Stafylakis, Dumouchel: Supervised/Unsupervised Voice Activity Detectors for
+    Text-dependent Speaker Recognition on the RSR2015 Corpus, Odyssey, 2014
+
+    :param cep:
+    :param initial_speech_scores:
+    :param init_percentile:
+    :param distrib_nb:
+    :param nb_train_it:
+    :param flooring:
+    :param ceiling:
+    :param sliding_window:
+    :param threshold_percentile:
+    :return:
+    """
+
+    # speech vs. non speech gmm, init
+    init_ns = numpy.percentile(initial_speech_scores, init_percentile, interpolation='nearest')
+    init_ss = numpy.percentile(initial_speech_scores, 100 - init_percentile, interpolation='nearest')
+
+    ind_ns = initial_speech_scores <= init_ns
+    ind_ss = initial_speech_scores >= init_ss
+
+    # GMMs
+    gmm_ns = train_vad_gmm(data=cep[ind_ns, :], distrib_nb=distrib_nb, nb_train_it=nb_train_it, flooring=flooring, ceiling=ceiling)
+    gmm_ss = train_vad_gmm(data=cep[ind_ss, :], distrib_nb=distrib_nb, nb_train_it=nb_train_it, flooring=flooring, ceiling=ceiling)
+    scores_ns = gmm_ns.compute_log_posterior_probabilities(cep)
+    scores_ss = gmm_ss.compute_log_posterior_probabilities(cep)
+    llr = scores_ss - scores_ns
+    llr = numpy.convolve(llr, numpy.ones((sliding_window,))/sliding_window, mode='same')
+
+    # Compute threshold
+    threshold = (numpy.percentile(llr, threshold_percentile, interpolation='nearest') +
+                 numpy.percentile(llr, 100 - threshold_percentile, interpolation='nearest')) / 2
+
+    # Apply frame selection with the current threshold
+    label = llr > threshold
+    return label, threshold
+
+
+def vad_spectral_flatness(spec, sliding_window=9, percentile=10):
+    spectral_flatness = - 10 * numpy.log10(gmean(spec,axis=1) / spec.mean(axis=1))
+    spectral_flatness = numpy.convolve(spectral_flatness, numpy.ones((sliding_window,))/sliding_window, mode='same')
+
+    threshold = numpy.percentile(spectral_flatness, percentile, interpolation='nearest')
+
+    return spectral_flatness, threshold
+
+
+def vad_most_dominant_frequency_component(spec, sr=8000, min_freq=200, max_freq=3800, sliding_window=9, percentile=10):
+    most_dominant_frequency_component = spec.argmax(axis=1)
+    most_dominant_frequency_component = numpy.convolve(most_dominant_frequency_component, numpy.ones((sliding_window,))/sliding_window, mode='same')
+
+    threshold = numpy.percentile(most_dominant_frequency_component, percentile, interpolation='nearest')
+
+    return most_dominant_frequency_component, threshold
+
+
+"""
+def vad_pitch_librosa(spec, sliding_window=3):
+    pitches, magnitudes = librosa.piptrack(S=spec.T)
+    m_max = numpy.argmax(magnitudes, axis=0)
+    pitch = numpy.array([pitches[m_max[i],i] for i in range(m_max.shape[0])])
+    pitch = numpy.convolve(pitch, numpy.ones((sliding_window,))/sliding_window, mode='same')
+    return pitch
+"""
 
 
 def vad_snr(sig, snr, fs=16000, shift=0.01, nwin=256):
@@ -394,6 +478,71 @@ def vad_snr(sig, snr, fs=16000, shift=0.01, nwin=256):
     label = (std2 > numpy.max(std2) - snr) & (std2 > -75)
 
     return label
+
+
+def vad_hangover_scheme(label, hangover_speech_states=4, hangover_nonspeech_states=10):
+    """
+    Hangover scheme as proposed in
+    Davis, Nordholm, Togneri: Statistical Voice Activity Detection Using Low-Variance Spectrum Estimation and
+    an Adaptive Threshold, IEEE TASLP, 14(2), 2006
+
+    :param label: VAD labels
+    :param hangover_speech_states: number of consecutive speech states, so the speech state is set
+    :param hangover_nonspeech_states: number of consecutive non-speech states, delaying the non-speech decision
+    :return: delayed non-speech decision VAD label
+    """
+    label[0] = False
+    transition = numpy.diff(label)
+    transition_idx = numpy.where(transition)[0] + 1
+    speech_state = False
+    skip_state = False
+    for idx, tidx in enumerate(transition_idx):
+        if skip_state:
+            skip_state = False
+            continue
+
+        if idx == len(transition_idx)-1:
+            next_tidx = len(label)
+        else:
+            next_tidx = transition_idx[idx+1]
+
+        distance = next_tidx - tidx
+
+        if speech_state:
+            label[tidx:tidx+hangover_nonspeech_states] = True
+            if distance >= hangover_nonspeech_states:
+                speech_state = False
+            else:
+                skip_state = True
+        else:
+            if distance >= hangover_speech_states:
+                speech_state = True
+
+    return label
+
+
+def vad_sfm_mdfc_gmm_snr_hangover(sig, cep, spec, snr, fs, shift, nwin, majority=2):
+    mdfc, mdfc_t = vad_most_dominant_frequency_component(spec)
+    sfm, sfm_t = vad_spectral_flatness(spec)
+    mdfc_lbl = mdfc > mdfc_t
+    sfm_lbl = sfm > sfm_t
+    gmm_lbl, gmm_t = vad_unsupervised_gmm(cep, initial_speech_scores=mdfc)
+    snr_lbl, snr_t = vad_snr(sig, snr, fs, shift, nwin)
+
+    """
+    mdfc_lbl = vad_hangover_scheme(mdfc_lbl)
+    sfm_lbl = vad_hangover_scheme(sfm_lbl)
+    gmm_lbl = vad_hangover_scheme(gmm_lbl)
+    snr_lbl = vad_hangover_scheme(snr_lbl)
+    """
+
+    # majority vote by 2
+    label = (mdfc_lbl + sfm_lbl + gmm_lbl + snr_lbl) > majority
+    label = vad_hangover_scheme(label)
+
+    threshold = snr_t # dummy
+
+    return label, threshold
 
 
 def label_fusion(label, win=3):

@@ -41,8 +41,8 @@ from fvckit.fvckit_wrappers import process_parallel_lists, deprecated, check_pat
 from fvckit import STAT_TYPE
 
 __license__ = "LGPL"
-__author__ = "Anthony Larcher and Sylvain Meignier (SIDEIT), Ewald Enzinger (FVCKIT)"
-__copyright__ = "Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEIT), Ewald Enzinger (FVCKIT)"
+__copyright__ = "Copyright 2014-2017 Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"
 __status__ = "Production"
@@ -89,6 +89,67 @@ def e_on_batch(stat0, stat1, ubm, F):
         e_hh[idx] = (inv_lambda + numpy.outer(e_h[idx], e_h[idx]))[upper_triangle_indices]
 
     return e_h, e_hh
+
+
+def e_on_batch_log_evidence(stat0, stat1, ubm, F):
+    """
+    Compute statistics for the Expectation step on a batch of data
+
+    :param stat0: matrix of zero-order statistics (1 session per line)
+    :param stat1: matrix of first-order statistics (1 session per line)
+    :param ubm: Mixture object
+    :param F: factor loading matrix
+    :return: first and second order statistics
+    """
+    tv_rank = F.shape[1]
+    nb_distrib = stat0.shape[1]
+    feature_size = ubm.mu.shape[1]
+    index_map = numpy.repeat(numpy.arange(nb_distrib), feature_size)
+    upper_triangle_indices = numpy.triu_indices(tv_rank)
+
+    gmm_covariance = "diag" if ubm.invcov.ndim == 2 else "full"
+
+    # Allocate the memory to save
+    session_nb = stat0.shape[0]
+    e_h = numpy.zeros((session_nb, tv_rank), dtype=STAT_TYPE)
+    e_hh = numpy.zeros((session_nb, tv_rank * (tv_rank + 1) // 2), dtype=STAT_TYPE)
+
+    # Whiten the statistics for diagonal or full models
+    stat1 -= stat0[:, index_map] * ubm.get_mean_super_vector()
+
+    if gmm_covariance == "diag":
+        stat1 *= numpy.sqrt(ubm.get_invcov_super_vector())
+    elif gmm_covariance == "full":
+        stat1 = numpy.einsum("ikj,ikl->ilj",
+                             stat1.T.reshape(-1, nb_distrib, session_nb),
+                             ubm.invchol
+                             ).reshape(-1, session_nb).T
+
+    log_evidence = 0
+    F_accum = numpy.zeros((tv_rank, nb_distrib, tv_rank))
+    for c in range(nb_distrib):
+        distrib_idx = range(c * feature_size, (c + 1) * feature_size)
+        F_accum[:, c, :] = F[distrib_idx,:].T.dot(F[distrib_idx,:])
+
+    for idx in range(session_nb):
+        inv_lambda = scipy.linalg.inv(numpy.eye(tv_rank) + (F.T * stat0[idx, index_map]).dot(F))
+        aux = F.T.dot(stat1[idx, :])
+        e_h[idx] = numpy.dot(aux, inv_lambda)
+        e_hh[idx] = (inv_lambda + numpy.outer(e_h[idx], e_h[idx]))[upper_triangle_indices]
+
+        # log evidence for standard i-vector, i.e. zero mean and identity prior
+        # see: Kenny, Stafylakis, Alam, Kockmann: An I-Vector Backend for Speaker Verification, Interspeech, 2015.
+        L = scipy.linalg.cholesky(inv_lambda).T
+        log_evidence -= - tv_rank - 2 * numpy.log(L.diagonal()).sum() + inv_lambda.trace() + scipy.linalg.norm(e_h[idx]) ** 2
+        supervector = F.dot(e_h[idx])
+        cov_accum = numpy.zeros((tv_rank, tv_rank))
+        for c in range(nb_distrib):
+            distrib_idx = range(c * feature_size, (c + 1) * feature_size)
+            log_evidence -= -2 * supervector[distrib_idx].T.dot(stat1[idx, distrib_idx]) + \
+                            stat0[idx, c] * scipy.linalg.norm(supervector[distrib_idx]) ** 2
+        log_evidence -= (stat0[idx, :].dot(F_accum)).dot(inv_lambda).trace()
+
+    return e_h, e_hh, 0.5 * log_evidence
 
 
 def e_worker(arg, q):
@@ -417,7 +478,7 @@ class FactorAnalyser:
 
             # MINIMUM DIVERGENCE STEP
             if min_div:
-                ch = scipy.linalg.cholesky(_R)
+                ch = scipy.linalg.cholesky(_R).T
                 self.F = self.F.dot(ch)
 
             # Save the FactorAnalyser
@@ -521,7 +582,7 @@ class FactorAnalyser:
                 if min_div:
                     _R_tmp = numpy.zeros((tv_rank, tv_rank), dtype=STAT_TYPE)
                     _R_tmp[upper_triangle_indices] = _R_tmp.T[upper_triangle_indices] = _R
-                    ch = scipy.linalg.cholesky(_R_tmp)
+                    ch = scipy.linalg.cholesky(_R_tmp).T
                     self.F = self.F.dot(ch)
 
                 # Save the current FactorAnalyser
@@ -657,7 +718,7 @@ class FactorAnalyser:
             if min_div:
                 _R_tmp = numpy.zeros((tv_rank, tv_rank), dtype=STAT_TYPE)
                 _R_tmp[upper_triangle_indices] = _R_tmp.T[upper_triangle_indices] = _R
-                ch = scipy.linalg.cholesky(_R_tmp)
+                ch = scipy.linalg.cholesky(_R_tmp).T
                 self.F = self.F.dot(ch)
 
             # Save the current FactorAnalyser
@@ -895,7 +956,7 @@ class FactorAnalyser:
             self.Sigma = sigma_obs - self.F.dot(_C) / session_per_model.sum()
 
             # Minimum Divergence step
-            self.F = self.F.dot(scipy.linalg.cholesky(_R))
+            self.F = self.F.dot(scipy.linalg.cholesky(_R).T)
 
             if output_file_name is None:
                 output_file_name = "temporary_plda"

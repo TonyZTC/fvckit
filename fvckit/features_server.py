@@ -38,7 +38,7 @@ from fvckit.sv_utils import parse_mask
 
 
 __license__ = "LGPL"
-__author__ = "Anthony Larcher and Sylvain Meignier (SIDEIT), Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher, Sylvain Meignier & Andreas Nautsch (SIDEIT), Ewald Enzinger (FVCKIT)"
 __copyright__ = "Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"
@@ -643,12 +643,14 @@ class FeaturesServer(object):
                                 label_list=None,
                                 start_list=None,
                                 stop_list=None,
-                                num_thread=1):
+                                num_thread=1,
+                                num_samples_per_queue=50):
         """Load a list of feature files and stack them in a unique ndarray. 
         The list of files to load is splited in sublists processed in parallel
         
         :param fileList: a list of files to load
-        :param numThread: numbe of thead (optional, default is 1)
+        :param numThread: number of thead (optional, default is 1)
+        :param num_samples_per_queue: number of samples per parallel processing queue (optional, default if 50)
         """
         if channel_list is None:
             channel_list = numpy.zeros(len(show_list))
@@ -663,39 +665,69 @@ class FeaturesServer(object):
 
 
         #queue_in = Queue.Queue(maxsize=len(fileList)+numThread)
-        queue_in = multiprocessing.JoinableQueue(maxsize=len(show_list)+num_thread)
-        queue_out = []
-        
-        # Start worker processes
-        jobs = []
-        for i in range(num_thread):
-            queue_out.append(multiprocessing.Queue())
-            p = multiprocessing.Process(target=self._stack_features_worker, 
-                                        args=(queue_in, queue_out[i]))
-            jobs.append(p)
-            p.start()
-        
-        # Submit tasks
-        for task in zip(show_list, channel_list, feature_filename_list, label_list, start_list, stop_list):
-            queue_in.put(task)
+        """
+        keep queues short, as results are returned into shared memory via OS pipe, limited to 4GB
+        concept:
+         - numThread: number of shared memory processing units at a time
+         - len(fileList): number of shared memory slices to be processed
+         - output: concatenates slices to a single variable
 
-        # Add None to the queue to kill the workers
-        for task in range(num_thread):
-            queue_in.put(None)
-        
-        # Wait for all the tasks to finish
-        queue_in.join()
-                   
+        for furhter information, see:
+        https://stackoverflow.com/questions/31665328/python-3-multiprocessing-queue-deadlock-when-calling-join-before-the-queue-is-em
+        https://stackoverflow.com/questions/31708646/process-join-and-queue-dont-work-with-large-numbers
+        https://stackoverflow.com/questions/31230241/queue-vs-joinablequeue-in-python
+        https://stackoverflow.com/questions/21641887/python-multiprocessing-process-hangs-on-join-for-large-queue
+        https://stackoverflow.com/questions/717148/queue-queue-vs-collections-deque
+        https://stackoverflow.com/questions/27345332/process-vs-thread-with-regards-to-using-queue-deque-and-class-variable-for
+        """
+
+        num_slicings = int(numpy.ceil(len(show_list) / num_thread / num_samples_per_queue))
+        dim_output_features = (1 + self.delta + self.double_delta) * len(self.mask)
         output = []
-        for q in queue_out:
-            while True:
-                data = q.get()
-                if data is None:
-                    break
-                output.append(data)
 
-        for p in jobs:
-            p.join()
-        return numpy.concatenate(output, axis=0)
+        for sclicing_iter in range(num_slicings):
+            slice_start = sclicing_iter * num_thread * num_samples_per_queue
+            slice_end = min((sclicing_iter + 1) * num_thread * num_samples_per_queue, len(show_list))
 
+            queue_in = multiprocessing.JoinableQueue(maxsize=num_thread * num_samples_per_queue)
+            queue_out = []
+
+            # Start worker processes
+            jobs = []
+            for i in range(num_thread):
+                queue_out.append(multiprocessing.Queue())
+                p = multiprocessing.Process(target=self._stack_features_worker,
+                                            args=(queue_in, queue_out[i]))
+                jobs.append(p)
+                p.start()
+
+            # Submit tasks
+            for task in zip(show_list[slice_start:slice_end], channel_list[slice_start:slice_end],
+                            feature_filename_list[slice_start:slice_end], label_list[slice_start:slice_end],
+                            start_list[slice_start:slice_end], stop_list[slice_start:slice_end]):
+                queue_in.put(task)
+
+            # Add None to the queue to kill the workers
+            for task in range(num_thread):
+                queue_in.put(None)
+
+            # Wait for all the tasks to finish
+            queue_in.join()
+
+            for q in queue_out:
+                while True:
+                    data = q.get()
+                    if data is None:
+                        break
+                    output.append(data)
+
+            for p in jobs:
+                p.join()
+
+        logging.info('concatenate and save memory-sliced features')
+        # return numpy.concatenate(output, axis=0)
+        output = numpy.concatenate(output, axis=0)
+        # numpy.save(file=out_file_name, arr=out_data)
+        write_matrix_hdf5(output, out_file_name)
+        logging.info('features normalized, memory file written')
 

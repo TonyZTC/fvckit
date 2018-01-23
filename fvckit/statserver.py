@@ -20,7 +20,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with FVCKIT.  If not, see <http://www.gnu.org/licenses/>.
 """
-Copyright 2014-2017 Sylvain Meignier and Anthony Larcher (SIDEKIT)
+Copyright 2014-2017 Sylvain Meignier, Anthony Larcher, Florent Desnous, Andreas Nautsch (SIDEKIT)
           2018      Ewald Enzinger (FVCKIT)
 
 :mod:`statserver` provides methods to manage zero and first statistics.
@@ -35,6 +35,7 @@ import os
 import scipy
 import sys
 import warnings
+import inspect
 
 from fvckit.bosaris import IdMap
 from fvckit.mixture import Mixture
@@ -50,8 +51,8 @@ if STAT_TYPE == numpy.float32:
 
 
 __license__ = "LGPL"
-__author__ = "Anthony Larcher and Sylvain Meignier (SIDEIT), Ewald Enzinger (FVCKIT)"
-__copyright__ = "Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher, Sylvain Meignier, Florent Desnous, Andreas Nautsch (SIDEIT), Ewald Enzinger (FVCKIT)"
+__copyright__ = "Copyright 2014-2017 Anthony Larcher, Sylvain Meignier, Florent Desnous, Andreas Nautsch (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"
 __status__ = "Production"
@@ -188,7 +189,8 @@ def load_existing_statistics_hdf5(statserver, statserver_file_name):
 
 
 class StatServer:
-    """A class for statistic storage and processing
+    """
+    A class for statistic storage and processing
 
     :attr modelset: list of model IDs for each session as an array of strings
     :attr segset: the list of session IDs as an array of strings
@@ -215,8 +217,8 @@ class StatServer:
         self.segset = numpy.empty(0, dtype="|O")
         self.start = numpy.empty(0, dtype="|O")
         self.stop = numpy.empty(0, dtype="|O")
-        self.stat0 = numpy.array([], dtype=STAT_TYPE)
-        self.stat1 = numpy.array([], dtype=STAT_TYPE)
+        self.stat0 = numpy.empty((self.segset.shape[0], distrib_nb), dtype=STAT_TYPE)
+        self.stat1 = numpy.empty((self.segset.shape[0], distrib_nb * feature_size), dtype=STAT_TYPE)
 
         if statserver_file_name is None:
             pass
@@ -312,18 +314,24 @@ class StatServer:
         """
         ok = self.modelset.ndim == 1 \
             and (self.modelset.shape == self.segset.shape == self.start.shape == self.stop.shape) \
-            and (self.stat0.shape[0] == self.stat1.shape[0] == self.modelset.shape[0]) \
-            and (not bool(self.stat1.shape[1] % self.stat0.shape[1]))
+            and (self.stat0.shape[0] == self.stat1.shape[0] == self.modelset.shape[0])
+        if not (self.stat1.shape[0] == self.stat0.shape[0] == self.modelset.shape[0] == self.segset.shape[0] ==
+                self.start.shape[0] == self.stop.shape[0] == 0):
+            ok = ok and (not bool(self.stat1.shape[1] % self.stat0.shape[1]))
 
         if warn and (self.segset.shape != numpy.unique(self.segset).shape):
                 logging.warning('Duplicated segments in StatServer')
         return ok
 
-    def merge(*arg):
+    def merge_get_list_unique_mod_seg_ids(arg):
         """
-        Merge a variable number of StatServers into one.
-        If a pair segmentID is duplicated, keep ony one
-        of them and raises a WARNING
++        Prepare merge, gather meta information about all StatServers to be merged.
++        note: externalized for the sake of easier class inheritance.
++
++        :param *arg: list of StatServer instances to be merged
++        :return id_set: list of unique modelID-segmentID
++        :return dim_stat0: dimensions of stat0
++        :return dim_stat1: dimensions of stat1
         """
         line_number = 0
         for idx, ss in enumerate(arg):
@@ -347,6 +355,16 @@ class StatServer:
         if line_number != len(id_set):
             print("WARNING: duplicated segmentID in input StatServers")
         
+        return id_set, dim_stat0, dim_stat1
+
+    def merge(*arg):
+        """
+        Merge a variable number of StatServers into one.
+        If a pair segmentID is duplicated, keep ony one
+        of them and raises a WARNING
+        """
+        id_set, dim_stat0, dim_stat1 = StatServer.merge_get_list_unique_mod_seg_ids(arg)
+
         # Initialize the new StatServer with unique set of segmentID
         new_stat_server = fvckit.StatServer()
         new_stat_server.modelset = numpy.empty(len(id_set), dtype='object')
@@ -430,11 +448,11 @@ class StatServer:
                                  maxshape=(None,),
                                  compression="gzip",
                                  fletcher32=True)
-                f.create_dataset(prefix+"stat0", data=self.stat0.astype(numpy.float32),
+                f.create_dataset(prefix+"stat0", data=self.stat0.astype(STAT_TYPE),
                                  maxshape=(None, self.stat0.shape[1]),
                                  compression="gzip",
                                  fletcher32=True)
-                f.create_dataset(prefix+"stat1", data=self.stat1.astype(numpy.float32),
+                f.create_dataset(prefix+"stat1", data=self.stat1.astype(STAT_TYPE),
                                  maxshape=(None, self.stat1.shape[1]),
                                  compression="gzip",
                                  fletcher32=True)
@@ -600,13 +618,28 @@ class StatServer:
         self.stat0 = self.stat0[indx, :]
         self.stat1 = self.stat1[indx, :]
 
+    def accumulate_stat_nested_template(self, ubm, feature_server, feature_server_stat1, count, idx, show, data, lp, pp, log_lk):
+        """
+        Template for inherited classes extending accumulate_stat function. Purpose: fill for estimating e.g., stat2
+        :param ubm: a Mixture object used to compute the statistics
+        :param feature_server: featureServer object
+        :param feature_server_stat1: featuresServer object used to compute the first order statistics
+        :param count: index from current for-enumeration loop
+        :param idx: segment idx from current for-enumeration loop
+        :param show: filename w/o channel from current for-enumeration loop
+        :param data: speech data from current for-enumeration loop
+        :param pp: summed probability per component from current for-enumeration loop
+        :param log_lk: log_lk corresponding to pp
+        """
+
     @process_parallel_lists
-    def accumulate_stat(self, ubm, feature_server, seg_indices=None, channel_extension=("", "_b"), num_thread=1):
+    def accumulate_stat(self, ubm, feature_server, feature_server_stat1=None, seg_indices=None, channel_extension=("", "_b"), num_thread=1):
         """Compute statistics for a list of sessions which indices 
             are given in segIndices.
         
         :param ubm: a Mixture object used to compute the statistics
-        :param feature_server: featureServer object
+        :param feature_server: featuresServer object
+        :param feature_server_stat1: optional featuresServer object used to compute the first order statistics
         :param seg_indices: list of indices of segments to process
               if segIndices is an empty list, process all segments.
         :param channel_extension: tuple of strings, extension of first and second channel for stereo files, default
@@ -616,13 +649,23 @@ class StatServer:
         assert isinstance(ubm, Mixture), 'First parameter has to be a Mixture'
         assert isinstance(feature_server, FeaturesServer), 'Second parameter has to be a FeaturesServer'
 
+        if feature_server_stat1 is not None:
+            assert isinstance(feature_server_stat1, FeaturesServer), 'Third parameter has to be a FeaturesServer'
+            sv_size = feature_server_stat1.load(self.segset[0])[0].shape[1] * ubm.distrib_nb()
+        else:
+            sv_size = ubm.sv_size()
+
         if (seg_indices is None) \
                 or (self.stat0.shape[0] != self.segset.shape[0]) \
                 or (self.stat1.shape[0] != self.segset.shape[0]):
             self.stat0 = numpy.zeros((self.segset.shape[0], ubm.distrib_nb()), dtype=STAT_TYPE)
-            self.stat1 = numpy.zeros((self.segset.shape[0], ubm.sv_size()), dtype=STAT_TYPE)
+            self.stat1 = numpy.zeros((self.segset.shape[0], sv_size), dtype=STAT_TYPE)
             seg_indices = range(self.segset.shape[0])
         feature_server.keep_all_features = True
+
+        flag_call_nested_accumulate_function = hash(inspect.getsource(self.accumulate_stat_nested_template)) \
+                                               is not \
+                                               hash(inspect.getsource(StatServer.accumulate_stat_nested_template))
 
         for count, idx in enumerate(seg_indices):
             logging.debug('Compute statistics for {}'.format(self.segset[idx]))
@@ -653,8 +696,18 @@ class StatServer:
                 # Compute 0th-order statistics
                 self.stat0[idx, :] = pp.sum(0)
                 # Compute 1st-order statistics
+                if feature_server_stat1 is not None:
+                    cep, _ = feature_server_stat1.load(show, channel=channel)
+                    data = cep[self.start[idx]:stop, :]
+                    data = data[vad[self.start[idx]:stop], :]
+
                 self.stat1[idx, :] = numpy.reshape(numpy.transpose(
-                        numpy.dot(data.transpose(), pp)), ubm.sv_size()).astype(STAT_TYPE)
+                        numpy.dot(data.transpose(), pp)), sv_size).astype(STAT_TYPE)
+
+                # check if accumulate_stat_nested_template is changed by inherited StatServer classes, then run code
+                if flag_call_nested_accumulate_function:
+                    self.accumulate_stat_nested_template(ubm, feature_server, feature_server_stat1,
+                                                         count, idx, show, data, lp, pp, foo)
 
     def get_mean_stat1(self):
         """Return the mean of first order statistics
@@ -910,6 +963,7 @@ class StatServer:
 
         # Choleski decomposition of the WCCN matrix
         invW = scipy.linalg.inv(WCCN)
+        invW = (invW + invW.T) / 2 # force symmetric
         W = scipy.linalg.cholesky(invW).T
         return W
 

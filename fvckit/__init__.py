@@ -21,7 +21,7 @@
 # along with FVCKIT.  If not, see <http://www.gnu.org/licenses/>.
 
 """
-Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT)
+Copyright 2014-2017 Anthony Larcher and Sylvain Meignier and Andreas Nautsch (SIDEKIT)
 Copyright 2018      Ewald Enzinger (FVCKIT)
 """
 
@@ -53,6 +53,7 @@ from fvckit.bosaris import IdMap
 from fvckit.bosaris import Ndx
 from fvckit.bosaris import Key
 from fvckit.bosaris import Scores
+from fvckit.bosaris import SegQuality
 from fvckit.bosaris import DetPlot
 from fvckit.bosaris import effective_prior
 from fvckit.bosaris import logit_effective_prior

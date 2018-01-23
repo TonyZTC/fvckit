@@ -28,7 +28,7 @@ from fvckit.bosaris.ndx import Ndx
 from fvckit.fvckit_wrappers import check_path_existance
 
 __author__ = "Anthony Larcher"
-__maintainer__ = "Anthony Larcher"
+__maintainer__ = "Anthony Larcher, Andreas Nautsch"
 __email__ = "anthony.larcher@univ-lemans.fr"
 __status__ = "Production"
 __docformat__ = 'reStructuredText'
@@ -118,6 +118,33 @@ class Key:
                              fletcher32=True)
             f.create_dataset("segset", data=self.segset.astype('S'),
                              maxshape=(None,),
+                             compression="gzip",
+                             fletcher32=True)
+            trialmask = numpy.array(self.tar, dtype='int8') - numpy.array(self.non, dtype='int8')
+            f.create_dataset("trial_mask", data=trialmask,
+                             maxshape=(None, None),
+                             compression="gzip",
+                             fletcher32=True)
+
+    @check_path_existance
+    def write_matlab(self, output_file_name):
+        """ Save Key in HDF5 format
+
+        :param output_file_name: name of the file to write to
+        """
+        assert self.validate(), "Error: wrong Key format"
+
+        with h5py.File(output_file_name, "w") as f:
+            f.create_dataset("ID/row_ids", data=self.modelset.astype('S'),
+                             maxshape=(None,),
+                             compression="gzip",
+                             fletcher32=True)
+            f.create_dataset("ID/column_ids", data=self.segset.astype('S'),
+                             maxshape=(None,),
+                             compression="gzip",
+                             fletcher32=True)
+            f.create_dataset("file_format", data=numpy.array(["2.0"]).astype('|S4'),
+                             maxshape=None,
                              compression="gzip",
                              fletcher32=True)
             trialmask = numpy.array(self.tar, dtype='int8') - numpy.array(self.non, dtype='int8')
@@ -222,8 +249,12 @@ class Key:
         with h5py.File(input_file_fame, "r") as f:
 
             key = Key()
-            key.modelset = f.get("modelset").value
-            key.segset = f.get("segset").value
+            if ("modelset" in f) and ("segset" in f):
+                key.modelset = f.get("modelset").value
+                key.segset = f.get("segset").value
+            else: # load from matlab
+                key.modelset = f.get("/ID/row_ids").value
+                key.segset = f.get("/ID/column_ids").value
 
             # if running python 3, need a conversion to unicode
             if sys.version_info[0] == 3:

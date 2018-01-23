@@ -179,7 +179,8 @@ class FeaturesExtractor(object):
     def extract(self, show, channel,
                 input_audio_filename=None,
                 output_feature_filename=None,
-                backing_store=False):
+                backing_store=False,
+                label_file_name=None):
         """
         Compute the acoustic parameters (filter banks, cepstral coefficients, log-energy and bottleneck features
         for a single channel from a given audio file.
@@ -189,6 +190,7 @@ class FeaturesExtractor(object):
         :param input_audio_filename: name of the input audio file to consider if the name of the audio file is independent from the ID of the show
         :param output_feature_filename: name of the output feature file to consider if the name of the feature file is independent from the ID of the show
         :param backing_store: boolean, if False, nothing is writen to disk, if True, the file is writen to disk when closed
+        :param label_file_name: Optional. name of the label file for the audio input file (for VAD)
         :param feature_type: can be mfcc or plp
         :param rasta: boolean, only for PLP parameters, if True, perform RASTA filtering
 
@@ -268,7 +270,15 @@ class FeaturesExtractor(object):
                                              rasta=self.rasta_plp)
                 
                 # Perform feature selection
-                label, threshold = self._vad(cep, energy, fb, signal[start:end, channel], os.path.splitext(audio_filename)[0] + '.vad')
+                #label, threshold = self._vad(cep, energy, fb, signal[start:end, channel], os.path.splitext(audio_filename)[0] + '.vad')
+                lbl_file_name = label_file_name
+                if label_file_name is not None:
+                    if '{' in label_file_name:
+                        if start is not None and end is not None:
+                            lbl_file_name = label_file_name.format(show, start, end)
+                        else:
+                            lbl_file_name = label_file_name.format(show)
+                label, threshold = self._vad(cep, energy, fb, signal[start:end, channel], lbl_file_name)
                 if len(label) < len(energy):
                     label = numpy.hstack((label, numpy.zeros(len(energy)-len(label), dtype='bool')))
 
@@ -325,19 +335,21 @@ class FeaturesExtractor(object):
 
         return h5f
 
-    def save(self, show, channel=0, input_audio_filename=None, output_feature_filename=None):
+    def save(self, show, channel=0, input_audio_filename=None, output_feature_filename=None, label_file_name=None):
         """
         Compute the acoustic parameters (filter banks, cepstral coefficients, log-energy and bottleneck features
         for a single channel from a given audio file and save them to disk in a HDF5 format
 
         :param show:
         :param channel:
-        :param input_audio_filename:
-        :param output_feature_filename:
+        :param input_audio_filename: Optional. 
+        :param output_feature_filename: Optional.
+        :param label_file_name: Optional. 
         :return:
         """
         # Load the cepstral coefficients, energy, filter-banks, bnf and vad labels
-        h5f = self.extract(show, channel, input_audio_filename, output_feature_filename, backing_store=True)
+        h5f = self.extract(show, channel, input_audio_filename, output_feature_filename, 
+                           backing_store=True, label_file_name=label_file_name)
         logging.info(h5f.filename)
 
         # Write the hdf5 file to disk
@@ -572,4 +584,4 @@ class FeaturesExtractor(object):
             feature_file_list = numpy.empty(int(max_length), dtype='|O')
 
         for show, channel, audio_file, feature_file in zip(show_list, channel_list, audio_file_list, feature_file_list):
-            self.save(show, channel, audio_file, feature_file)
+            self.save(show, channel, audio_file, feature_file, label_file_name)
