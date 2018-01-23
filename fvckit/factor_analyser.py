@@ -904,3 +904,164 @@ class FactorAnalyser:
                 self.write(output_file_name + "_it-{}.h5".format(it))
             elif it == nb_iter - 1:
                 self.write(output_file_name + ".h5")
+
+    # Feature added by Gaël Le Lan to dev branch of SIDEKIT, see:
+    # https://git-lium.univ-lemans.fr/Larcher/sidekit/commit/14ad026449dd9d1038c93dc9fdf7853e99e83149
+    def weighted_likelihood_plda(self,
+             out_stat_server,
+             in_stat_server,
+             alpha,
+             rank_f,
+             nb_iter=10,
+             scaling_factor=1.,
+             output_file_name=None,
+             save_partial=False):
+        """
+        Train a simplified Probabilistic Linear Discriminant Analysis model (no within class covariance matrix
+        but full residual covariance matrix)
+
+        :param out_stat_server: out-domain StatServer object with training statistics
+        :param rank_f: rank of the between class covariance matrix
+        :param nb_iter: number of iterations to run
+        :param scaling_factor: scaling factor to downscale statistics (value bewteen 0 and 1)
+        :param output_file_name: name of the output file where to store PLDA model
+        :param save_partial: boolean, if True, save PLDA model after each iteration
+        """
+        vect_size = out_stat_server.stat1.shape[1]
+
+
+        # Initialize mean and residual covariance from the training data
+        # First version
+        self.mean = alpha * in_stat_server.get_mean_stat1() + (1-alpha) * out_stat_server.get_mean_stat1()
+        self.Sigma = alpha * in_stat_server.get_total_covariance_stat1_mix(self.mean) \
+                      + (1-alpha) * out_stat_server.get_total_covariance_stat1_mix(self.mean)
+
+        # # Second version
+        # in_stat_server.center_stat1(in_stat_server.get_mean_stat1())
+        # out_stat_server.center_stat1(out_stat_server.get_mean_stat1())
+        # self.mean = 0.5 * in_stat_server.get_mean_stat1() + 0.5 * out_stat_server.get_mean_stat1()
+        # self.Sigma = alpha * in_stat_server.get_total_covariance_stat1() \
+        #               + (1-alpha) * out_stat_server.get_total_covariance_stat1()
+
+
+        # Sum stat per model
+        out_model_shifted_stat, out_session_per_model = out_stat_server.sum_stat_per_model()
+        in_model_shifted_stat, in_session_per_model = in_stat_server.sum_stat_per_model()
+        out_class_nb = out_model_shifted_stat.modelset.shape[0]
+        in_class_nb = in_model_shifted_stat.modelset.shape[0]
+
+        # Multiply statistics by scaling_factor
+        out_model_shifted_stat.stat0 *= scaling_factor
+        out_model_shifted_stat.stat1 *= scaling_factor
+        out_session_per_model *= scaling_factor
+
+        in_model_shifted_stat.stat0 *= scaling_factor
+        in_model_shifted_stat.stat1 *= scaling_factor
+        in_session_per_model *= scaling_factor
+
+        # Compute Eigen Decomposition of Sigma in order to initialize the EigenVoice matrix
+        sigma_obs = copy.deepcopy(self.Sigma)
+        evals, evecs = scipy.linalg.eigh(sigma_obs)
+        idx = numpy.argsort(evals)[::-1]
+        evecs = evecs.real[:, idx[:rank_f]]
+        self.F = evecs[:, :rank_f]
+
+        # Estimate PLDA model by iterating the EM algorithm
+        for it in range(nb_iter):
+            logging.info('Estimate between class covariance, it %d / %d', it + 1, nb_iter)
+
+            # E-step
+          #  print("E_step")
+
+            # Copy stats as they will be whitened with a different Sigma for each iteration
+            out_local_stat = copy.deepcopy(out_model_shifted_stat)
+
+            # Whiten statistics (with the new mean and Sigma)
+            out_local_stat.whiten_stat1(self.mean, self.Sigma)
+
+            # Copy stats as they will be whitened with a different Sigma for each iteration
+            in_local_stat = copy.deepcopy(in_model_shifted_stat)
+
+            # Whiten statistics (with the new mean and Sigma)
+            in_local_stat.whiten_stat1(self.mean, self.Sigma)
+
+
+            # Whiten the EigenVoice matrix
+            eigen_values, eigen_vectors = scipy.linalg.eigh(self.Sigma)
+            ind = eigen_values.real.argsort()[::-1]
+            eigen_values = eigen_values.real[ind]
+            eigen_vectors = eigen_vectors.real[:, ind]
+            sqr_inv_eval_sigma = 1 / numpy.sqrt(eigen_values.real)
+            sqr_inv_sigma = numpy.dot(eigen_vectors, numpy.diag(sqr_inv_eval_sigma))
+            self.F = sqr_inv_sigma.T.dot(self.F)
+
+            # Replicate self.stat0
+            index_map = numpy.zeros(vect_size, dtype=int)
+            _stat0 = out_local_stat.stat0[:, index_map]
+
+            e_h = numpy.zeros((out_class_nb, rank_f))
+            e_hh = numpy.zeros((out_class_nb, rank_f, rank_f))
+
+            # loop on model id's
+            fa_model_loop(batch_start=0,
+                          mini_batch_indices=numpy.arange(out_class_nb),
+                          factor_analyser=self,
+                          stat0=_stat0,
+                          stat1=out_local_stat.stat1,
+                          e_h=e_h,
+                          e_hh=e_hh,
+                          num_thread=1)
+
+            # Accumulate for minimum divergence step
+            out_R = numpy.sum(e_hh, axis=0) / out_session_per_model.shape[0]
+
+            out_C = e_h.T.dot(out_local_stat.stat1).dot(scipy.linalg.inv(sqr_inv_sigma))
+            out_A = numpy.einsum('ijk,i->jk', e_hh, out_local_stat.stat0.squeeze())
+
+            # Replicate self.stat0
+            index_map = numpy.zeros(vect_size, dtype=int)
+            _stat0 = in_local_stat.stat0[:, index_map]
+
+            e_h = numpy.zeros((in_class_nb, rank_f))
+            e_hh = numpy.zeros((in_class_nb, rank_f, rank_f))
+
+            # loop on model id's
+            fa_model_loop(batch_start=0,
+                          mini_batch_indices=numpy.arange(in_class_nb),
+                          factor_analyser=self,
+                          stat0=_stat0,
+                          stat1=in_local_stat.stat1,
+                          e_h=e_h,
+                          e_hh=e_hh,
+                          num_thread=1)
+
+            # Accumulate for minimum divergence step
+            in_R = numpy.sum(e_hh, axis=0) / in_session_per_model.shape[0]
+
+            in_C = e_h.T.dot(in_local_stat.stat1).dot(scipy.linalg.inv(sqr_inv_sigma))
+            in_A = numpy.einsum('ijk,i->jk', e_hh, in_local_stat.stat0.squeeze())
+
+            in_alpha = alpha / in_session_per_model.sum()
+            out_alpha = (1 - alpha) / out_session_per_model.sum()
+
+            _A = in_alpha * in_A + out_alpha * out_A
+            _C = in_alpha * in_C + out_alpha * out_C
+            _R = alpha * in_R + (1 - alpha) * out_R
+
+            # M-step
+            self.F = scipy.linalg.solve(_A, _C).T
+
+            # Update the residual covariance
+            self.Sigma = sigma_obs - self.F.dot(_C)
+
+            # Minimum Divergence step
+            self.F = self.F.dot(scipy.linalg.cholesky(_R))
+
+            if output_file_name is None:
+                output_file_name = "temporary_plda"
+
+            if save_partial and it < nb_iter - 1:
+                self.write(output_file_name + "_it-{}.h5".format(it))
+            elif it == nb_iter - 1:
+                self.write(output_file_name + ".h5")
+
