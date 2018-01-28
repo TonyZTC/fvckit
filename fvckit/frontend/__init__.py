@@ -61,7 +61,7 @@ from fvckit.frontend.features import mfcc
 from fvckit.frontend.features import pca_dct
 from fvckit.frontend.features import shifted_delta_cepstral
 
-__author__ = "Anthony Larcher and Sylvain Meignier (SIDEIT), Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher and Sylvain Meignier (SIDEKIT), Ewald Enzinger (FVCKIT)"
 __copyright__ = "Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __license__ = "LGPL"
 __maintainer__ = "Ewald Enzinger"

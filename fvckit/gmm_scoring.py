@@ -42,7 +42,7 @@ from fvckit.bosaris import Scores
 
 
 __license__ = "LGPL"
-__author__ = "Anthony Larcher and Sylvain Meignier (SIDEIT), Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher and Sylvain Meignier (SIDEKIT), Ewald Enzinger (FVCKIT)"
 __copyright__ = "Copyright 2014-2017 Anthony Larcher and Sylvain Meignier (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"

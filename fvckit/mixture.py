@@ -38,7 +38,7 @@ from fvckit.sv_utils import mean_std_many
 import sys
 
 __license__ = "LGPL"
-__author__ = "Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEIT), Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEKIT), Ewald Enzinger (FVCKIT)"
 __copyright__ = "Copyright 2014-2017 Anthony Larcher, Sylvain Meignier, Andreas Nautsch (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"

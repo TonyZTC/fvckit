@@ -51,7 +51,7 @@ if STAT_TYPE == numpy.float32:
 
 
 __license__ = "LGPL"
-__author__ = "Anthony Larcher, Sylvain Meignier, Florent Desnous, Andreas Nautsch (SIDEIT), Ewald Enzinger (FVCKIT)"
+__author__ = "Anthony Larcher, Sylvain Meignier, Florent Desnous, Andreas Nautsch (SIDEKIT), Ewald Enzinger (FVCKIT)"
 __copyright__ = "Copyright 2014-2017 Anthony Larcher, Sylvain Meignier, Florent Desnous, Andreas Nautsch (SIDEKIT), 2018 Ewald Enzinger (FVCKIT)"
 __maintainer__ = "Ewald Enzinger"
 __email__ = "ewald.enzinger@entn.at"
